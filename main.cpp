@@ -1,5 +1,5 @@
 
-
+#include "libssh2_config.h"
 #ifdef HAVE_WINSOCK2_H
 #include <winsock2.h>
 #endif
@@ -27,6 +27,7 @@
 #endif
 
 #ifdef WIN32
+#include <conio.h>
 #include <windows.h>
 #else
 #include <pwd.h>
@@ -55,7 +56,6 @@ static int waitsocket(int socket_fd, LIBSSH2_SESSION *session)
     timeout.tv_usec = 0;
 
     FD_ZERO(&fd);
-
     FD_SET(socket_fd, &fd);
 
     /* now make sure we wait in the correct direction */
@@ -64,13 +64,47 @@ static int waitsocket(int socket_fd, LIBSSH2_SESSION *session)
 
     if (dir & LIBSSH2_SESSION_BLOCK_INBOUND)
         readfd = &fd;
-
     if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND)
         writefd = &fd;
-
     rc = select(socket_fd + 1, readfd, writefd, NULL, &timeout);
 
     return rc;
+}
+
+int clean(LIBSSH2_SESSION* session, int sock)
+{
+    libssh2_session_disconnect(session,
+
+        "Normal Shutdown, Thank you for playing");
+    libssh2_session_free(session);
+
+
+#ifdef WIN32
+    closesocket(sock);
+#else
+    close(sock);
+#endif
+    fprintf(stderr, "all done\n");
+
+    libssh2_exit();
+    return 0;
+}
+
+void input_passwd(string& passwd)
+{
+    char ch;
+    passwd.clear();
+#ifdef WIN32
+    while ((ch = getch()) != 'r')
+    {
+        passwd += ch;
+    }
+#else
+    system("stty -echo");
+    cin >> passwd;
+    cout << endl;
+    system("stty echo");
+#endif
 }
 
 int main(int argc, char *argv[])
@@ -85,7 +119,7 @@ int main(int argc, char *argv[])
     }
 #endif
     
-    if (argc != 2)
+    if (argc != 3)
     {
         cout << "Lack of arguments!" << endl;
         return -1;
@@ -98,14 +132,35 @@ int main(int argc, char *argv[])
         perror("libssh2 initialization failed: ");
         return -1;
     }
+
+    char cur_user[1024] = { 0 };
+#ifdef WIN32
+    unsigned long dwNameLen = 0;
+    GetUserName(cur_user, &dwNameLen);
+#else // UNIX like
+    struct passwd* pwd = getpwuid(getuid());
+    strcpy(cur_user, pwd->pw_name);
+#endif 
+
+    string username;
+    string hostname;
     int pos = host.find('@');
-    if (pos == 0 || pos == string::npos || pos == host.length() - 1) {
+    if (pos == 0 || pos == host.length() - 1) {
         cout << "Invalid arguments!" << endl;
         return -1;
     }
-    string username = host.substr(0, pos);
-    string hostname = host.substr(pos + 1);
-    unsigned long hostaddr = inet_addr(hostname);
+    else if (pos == string::npos) 
+    {
+        username = cur_user;
+        hostname = host;
+    }
+    else
+    {
+        username = host.substr(0, pos);
+        hostname = host.substr(pos + 1);
+    }
+    
+    unsigned long hostaddr = inet_addr(hostname.c_str());
 
     /* Ultra basic "connect to port 22 on localhost"
     * Your code is responsible for creating the socket establishing the
@@ -186,73 +241,61 @@ int main(int argc, char *argv[])
     }
     libssh2_knownhost_free(nh);
 
-    char cur_user[1024] = { 0 };
-#ifdef WIN32
-    unsigned long dwNameLen = 0;
-    GetUserName(cur_user, &dwNameLen);
-#else // UNIX like
-    struct passwd* pwd = getpwuid(getuid());
-    strcpy(cur_user, pwd->pw_name);
-#endif 
+
 
     string keypath = strcmp(cur_user, "root") == 0 ? "/root/.ssh/" : "/home/" + username + "/.ssh/";
-    if(access(keypath+"id_rsa.pub", F_OK) != 0 || access(keypath + "id_rsa", F_OK) != 0)
-    {
-        cout << "Lack of key pairs or be damaged." << endl;
-        cout << "Do you want to generate the key pairs (yes/no)?" << endl;
-        string str;
-        cin.getline();
-        if (str == "yes")
-        {
-            //Generate key pairs.
-        }
-    }
+    //if(access((keypath+"id_rsa.pub").c_str(), F_OK) != 0 || access((keypath + "id_rsa").c_str(), F_OK) != 0)
+    //{
+    //    cout << "Lack of key pairs or be damaged." << endl;
+    //    cout << "Do you want to generate the key pairs (yes/no)?" << endl;
+    //    string str;
+    //    getline(cin, str);
+    //    if (str == "yes")
+    //    {
+    //        //Generate key pairs.
+    //    }
+    //}
     int signal = 0;
-    while (access((keypath + "id_rsa.pub").c_str(), F_OK) == 0 && access((keypath + "id_rsa").c_str(), F_OK) == 0)
-    {
-        /* Or by public key */
-        while ((rc = libssh2_userauth_publickey_fromfile(session, username.c_str(), 
-            (keypath + "id_rsa.pub").c_str(), (keypath + "id_rsa").c_str(), NULL)) == LIBSSH2_ERROR_EAGAIN);
-        if (rc == LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED) {
-            cout << "The username/public key combination was invalid or the password is not null." << endl;
-            if (signal == 0)
-            {
-                cout << "Do you want to generate the key pairs (yes/no)?" << endl;
-                string str;
-                getline(cin, str);
-                if (str == "yes")
-                {
-                    //Generate key pairs.
-                    continue;
-                }
-            }
-            signal = 0;
-            break;
-        }
-        else if (rc)
-        {
-            fprintf(stderr, "\tAuthentication by public key failed\n");
-            goto shutdown;
-        }
-        signal = 1;
-    }
+    //while (access((keypath + "id_rsa.pub").c_str(), F_OK) == 0 && access((keypath + "id_rsa").c_str(), F_OK) == 0)
+    //{
+    //    /* Or by public key */
+    //    while ((rc = libssh2_userauth_publickey_fromfile(session, username.c_str(), 
+    //        (keypath + "id_rsa.pub").c_str(), (keypath + "id_rsa").c_str(), NULL)) == LIBSSH2_ERROR_EAGAIN);
+    //    if (rc == LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED) {
+    //        cout << "The username/public key combination was invalid or the password is not null." << endl;
+    //        if (signal == 0)
+    //        {
+    //            cout << "Do you want to generate the key pairs (yes/no)?" << endl;
+    //            string str;
+    //            getline(cin, str);
+    //            if (str == "yes")
+    //            {
+    //                //Generate key pairs.
+    //                continue;
+    //            }
+    //        }
+    //        signal = 0;
+    //        break;
+    //    }
+    //    else if (rc)
+    //    {
+    //        fprintf(stderr, "\tAuthentication by public key failed\n");
+    //        return clean(session, sock);
+    //    }
+    //    signal = 1;
+    //}
     if (signal == 0)
     {
         cout << host << "'s password:";
-        char ch;
         string password;
-        while (cin.get(ch))
-        {
-            password += ch;
-            cout << '*';
-        }
+        input_passwd(password);
         if (password.length() > 0)
         {
             /* We could authenticate via password */
             while ((rc = libssh2_userauth_password(session, username.c_str(), password.c_str())) == LIBSSH2_ERROR_EAGAIN);
             if (rc) {
-                perror("Authentication by password failed:");
-                goto shutdown;
+                perror("Authentication by password failed: ");
+                return clean(session, sock);
             }
         }
     }
@@ -281,12 +324,12 @@ int main(int argc, char *argv[])
         string remote_authorized_keys = (username == "root" ? "/root/" : "/home/" + username) + "/.ssh/authorized_keys";
         snprintf(commandline, sizeof(commandline),
             "echo %s >> %s;if [ ! -d %s ];then mkdir -p %s;elif [ ! -x %s ];then echo error;fi", 
-            pub_key.c_str(), remote_authorized_keys, path, path, path);
+            pub_key.c_str(), remote_authorized_keys, path.c_str(), path.c_str(), path.c_str());
     }
     else
     {
         snprintf(commandline, sizeof(commandline),
-            "if [ ! -d %s ];then mkdir -p %s;elif [ ! -x %s ];then echo error;fi", path, path, path);
+            "if [ ! -d %s ];then mkdir -p %s;elif [ ! -x %s ];then echo error;fi", path.c_str(), path.c_str(), path.c_str());
     }
     while ((rc = libssh2_channel_exec(channel, commandline)) == LIBSSH2_ERROR_EAGAIN)
     {
@@ -297,28 +340,26 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Error\n");
         exit(1);
     }
-    for (;; )
+
+    int bytecount = 0;
+    char buffer[1024] = { 0 };
+    while(true)
     {
         /* loop until we block */
-        int rc;
+        int rc; 
         do
         {
-            char buffer[0x4000];
-            rc = libssh2_channel_read(channel, buffer, sizeof(buffer));
-
+            rc = libssh2_channel_read_stderr(channel, buffer + bytecount, sizeof(buffer) - bytecount);
             if (rc > 0)
             {
-                int i;
                 bytecount += rc;
-                fprintf(stderr, "We read:\n");
-                for (i = 0; i < rc; ++i)
-                    fputc(buffer[i], stderr);
-                fprintf(stderr, "\n");
             }
-            else {
+            else 
+            {
                 if (rc != LIBSSH2_ERROR_EAGAIN)
-                    /* no need to output this for the EAGAIN case */
+                {   /* no need to output this for the EAGAIN case */
                     fprintf(stderr, "libssh2_channel_read returned %d\n", rc);
+                }
             }
         } while (rc > 0);
 
@@ -329,48 +370,35 @@ int main(int argc, char *argv[])
             waitsocket(sock, session);
         }
         else
+        {
             break;
+        }
     }
-    exitcode = 127;
+
+    int exitcode = 127;
     while ((rc = libssh2_channel_close(channel)) == LIBSSH2_ERROR_EAGAIN)
-
+    {
         waitsocket(sock, session);
-
+    }
+    char *exitsignal = (char *)"none";
     if (rc == 0)
     {
         exitcode = libssh2_channel_get_exit_status(channel);
-
-        libssh2_channel_get_exit_signal(channel, &exitsignal,
-
-            NULL, NULL, NULL, NULL, NULL);
+        libssh2_channel_get_exit_signal(channel, &exitsignal, NULL, NULL, NULL, NULL, NULL);
     }
 
     if (exitsignal)
+    {
         fprintf(stderr, "\nGot signal: %s\n", exitsignal);
+    }
     else
+    {
         fprintf(stderr, "\nEXIT: %d bytecount: %d\n", exitcode, bytecount);
-
+    }
+    cout << buffer << endl;
     libssh2_channel_free(channel);
 
     channel = NULL;
-
-shutdown:
-
-    libssh2_session_disconnect(session,
-
-        "Normal Shutdown, Thank you for playing");
-    libssh2_session_free(session);
-
-
-#ifdef WIN32
-    closesocket(sock);
-#else
-    close(sock);
-#endif
-    fprintf(stderr, "all done\n");
-
-    libssh2_exit();
-
-
+    clean(session, sock);
     return 0;
 }

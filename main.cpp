@@ -1,140 +1,281 @@
+#if (defined(WIN32) /*||defined(_WIN32)*/  || defined(__WIN32) || defined(_WIN64) || defined(__WIN64)) && !defined(WINDOWS_ENV)
+#define WINDOWS_ENV
+#endif
 
-#include "libssh2_config.h"
-#ifdef HAVE_WINSOCK2_H
-#include <winsock2.h>
-#endif
-#ifdef HAVE_SYS_SOCKET_H
-#include <sys/socket.h>
-#endif
-#ifdef HAVE_NETINET_IN_H
-#include <netinet/in.h>
-#endif
-#ifdef HAVE_SYS_SELECT_H
-#include <sys/select.h>
-#endif
-#ifdef HAVE_UNISTD_H
-#include <unistd.h>
-#endif
-#ifdef HAVE_ARPA_INET_H
-#include <arpa/inet.h>
-#endif
-#ifdef HAVE_SYS_TIME_H
-#include <sys/time.h>
-#endif
-#include <sys/types.h>
-#ifdef HAVE_STDLIB_H
+#include <map>
+#include <cstdio>
 #include <cstdlib>
-#endif
+#include <cstring>
+#include <queue>
+#include <iomanip>
 
-#ifdef WIN32
+
+#include "Log.h"
+#ifdef WINDOWS_ENV
 #include <conio.h>
 #include <windows.h>
 #else
+#include <sys/types.h>
 #include <pwd.h>
+#include <dirent.h>
+#include <sys/inotify.h>
 #endif
-
-#include <libssh2.h>
-#include <fcntl.h>
-#include <cerrno>
-#include <cstdio>
-#include <cctype>
-#include <string>
-#include <iostream>
-#include <fstream>
 using namespace std;
 
-static int waitsocket(int socket_fd, LIBSSH2_SESSION *session)
+const unsigned long DIR_IN_MASK = IN_CREATE | IN_DELETE | IN_MOVE;
+const unsigned long FIL_IN_MASK = IN_ATTRIB | IN_MODIFY;
+
+string localpath;
+string remotepath;
+string hostname;
+string username;
+bool debug_mode = false;
+int port = 22;
+Log log;
+/* Structure describing an inotify event.  */
+struct _inotify_event
 {
-    struct timeval timeout;
-    int rc;
-    fd_set fd;
-    fd_set *writefd = NULL;
-    fd_set *readfd = NULL;
-    int dir;
+    int wd;		/* Watch descriptor.  */
+    uint32_t mask;	/* Watch mask.  */
+    uint32_t cookie;	/* Cookie to synchronize two events.  */
+    uint32_t len;		/* Length (including NULs) of name.  */
+    string name;	/* Name.  */
+};
 
-    timeout.tv_sec = 10;
-    timeout.tv_usec = 0;
-
-    FD_ZERO(&fd);
-    FD_SET(socket_fd, &fd);
-
-    /* now make sure we wait in the correct direction */
-    dir = libssh2_session_block_directions(session);
-
-
-    if (dir & LIBSSH2_SESSION_BLOCK_INBOUND)
-        readfd = &fd;
-    if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND)
-        writefd = &fd;
-    rc = select(socket_fd + 1, readfd, writefd, NULL, &timeout);
-
-    return rc;
-}
-
-int clean(LIBSSH2_SESSION* session, int sock)
+int Recur_Dir(const string& path, const int& fd, map<int, string>& wd_map)
 {
-    libssh2_session_disconnect(session,
-
-        "Normal Shutdown, Thank you for playing");
-    libssh2_session_free(session);
-
-
-#ifdef WIN32
-    closesocket(sock);
+#ifdef WINDOWS_ENV
 #else
-    close(sock);
-#endif
-    fprintf(stderr, "all done\n");
-
-    libssh2_exit();
+    DIR *dir;
+    if ((dir = opendir(path.c_str())) == NULL)
+    {
+        return -1;
+    }
+    int wd = inotify_add_watch(fd, path.c_str(), DIR_IN_MASK);
+    if (wd < 0)
+    {
+        return -1;
+    }
+    wd_map[wd] = path;
+    log << "Add wd: " << wd << ", name: " << wd_map[wd] << _endl_;
+    struct dirent *ptr;
+    while ((ptr = readdir(dir)) != NULL)
+    {
+        if (strcmp(ptr->d_name, ".") == 0 || strcmp(ptr->d_name, "..") == 0) continue;
+        if (ptr->d_type == DT_DIR)
+        {      
+            if (Recur_Dir(path + "/" + ptr->d_name, fd, wd_map) < 0)
+            {
+                return -1;
+            }  
+        }
+        else
+        {
+            wd = inotify_add_watch(fd, (path + "/" + ptr->d_name).c_str(), FIL_IN_MASK);      
+            if (wd < 0)
+            {
+                return -1;
+            }
+            wd_map[wd] = path + "/" + ptr->d_name;
+            log << "Add wd: " << wd << ", name: " << wd_map[wd] << _endl_;
+        }
+    }
+    closedir(dir); 
+#endif 
     return 0;
 }
 
-void input_passwd(string& passwd)
-{
-    char ch;
-    passwd.clear();
-#ifdef WIN32
-    while ((ch = getch()) != 'r')
-    {
-        passwd += ch;
-    }
+int Read_Event(
+#ifdef WINDOWS_ENV
 #else
-    system("stty -echo");
-    cin >> passwd;
-    cout << endl;
-    system("stty echo");
+    queue<_inotify_event*>& event_que
+#endif
+    , const int& fd)
+{
+    char buffer[16384];
+    int count = 0;
+#ifdef WINDOWS_ENV
+#else
+    ssize_t rd_size = read(fd, buffer, 16384);
+    if (rd_size <= 0)
+        return rd_size;
+    
+    for (size_t buffer_i = 0; buffer_i < rd_size; ++count)
+    {
+        _inotify_event* pevent = new _inotify_event;
+        inotify_event* tmp = (inotify_event*)(buffer + buffer_i);
+        memmove(pevent, tmp, offsetof(inotify_event, name));
+        pevent->name = tmp->name;
+        buffer_i += offsetof(inotify_event, name) + tmp->len;
+        event_que.push(pevent);
+    }
+#endif
+    return count;
+}
+
+void Handle_Events(
+#ifdef WINDOWS_ENV 
+#else
+    queue<_inotify_event*>& event_que,
+#endif
+    const int& fd, map<int, string>& wd_map
+)
+{
+#ifdef WINDOWS_ENV
+#else
+    while (event_que.size() > 0)
+    {
+        _inotify_event* event = event_que.front();
+        int cur_event_wd = event->wd;
+        string cur_event_filename = event->name;
+        if (wd_map.find(cur_event_wd) == wd_map.end())
+        {
+            log << "Warning: couldn't find the wd: " << cur_event_wd << _endl_;
+            break;
+        }
+        else
+        {
+            log << "Handle wd: " << cur_event_wd << ", name: " << cur_event_filename << _endl_;
+            //cout << hex << (event->mask &(IN_ALL_EVENTS | IN_UNMOUNT | IN_Q_OVERFLOW | IN_IGNORED)) << dec << endl;
+            switch (event->mask &(IN_ALL_EVENTS | IN_UNMOUNT | IN_Q_OVERFLOW | IN_IGNORED))
+            {
+            case IN_CREATE:
+            case IN_MOVED_FROM:
+            {
+                boost::format fmt = (event->mask & IN_ISDIR) ?
+                    boost::format(" -r -p %1% %2% %3%@%4%:%5%") : boost::format(" -p %1% %2% %3%@%4%:%5%");
+
+                string full_path = wd_map[cur_event_wd] + "/" + cur_event_filename;
+                string re_path = full_path.substr(localpath.length());
+                string option = boost::str(fmt % port % full_path % username % hostname % (remotepath + re_path));
+                log << "Exec cmd: scp" + option << _endl_;
+                //system(("scp" + option).c_str());
+
+                //Add these new file or directory to listen event
+                if ((event->mask & IN_ISDIR))
+                {
+                    Recur_Dir(wd_map[cur_event_wd] + "/" + cur_event_filename, fd, wd_map);
+                }
+                else
+                {
+                    int wd = inotify_add_watch(fd, (wd_map[cur_event_wd] + "/" + cur_event_filename).c_str(), FIL_IN_MASK);
+                    if (wd < 0)
+                    {
+                        log << "Add watch failed: " << wd_map[cur_event_wd] + "/" + cur_event_filename << _endl_;
+                        break;
+                    }
+                    wd_map[wd] = wd_map[cur_event_wd] + "/" + cur_event_filename;
+                    log << "Add wd: " << wd << ", name: " << wd_map[wd] << _endl_;
+                }
+
+                break;
+            }
+            case IN_MOVED_TO:
+            case IN_DELETE:
+            {
+                boost::format option_fmt(" -p %1% %2%@%3% ");
+                string option = boost::str(option_fmt % port % username % hostname);
+                boost::format cmd_fmt("'rm -rf %1%'");
+                string cmd_string = boost::str(cmd_fmt % (wd_map[cur_event_wd] + "/" + cur_event_filename));
+                log << "Exec cmd: ssh" + option + cmd_string << _endl_;
+                //system(("ssh" + option + cmd_string).c_str());
+                break;
+            }
+            case IN_IGNORED:
+                inotify_rm_watch(fd, cur_event_wd);
+                wd_map.erase(wd_map.find(cur_event_wd));
+                log << "Remove wd: " << cur_event_wd << _endl_;
+                break;
+            case IN_MODIFY:
+            case IN_ATTRIB:
+            {
+                boost::format fmt = boost::format(" -p %1% %2% %3%@%4%:%5%");
+                string full_path = wd_map[cur_event_wd];
+                string re_path = full_path.substr(localpath.length());
+                string option = boost::str(fmt % port % full_path % username % hostname % (remotepath + re_path));
+                log << "Exec cmd: scp" + option << _endl_;
+                //system(("scp" + option).c_str());
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        delete event;
+        event_que.pop();
+    }
 #endif
 }
 
-int main(int argc, char *argv[])
+int File_Monitor()
 {
-
-#ifdef WIN32
-    WSADATA wsadata;
-    int err = WSAStartup(MAKEWORD(2, 0), &wsadata);
-    if (err != 0) {
-        fprintf(stderr, "WSAStartup failed with error: %d\n", err);
-        return 1;
+#ifdef WINDOWS_ENV
+#else
+    int fd = inotify_init();
+    if (fd < 0)
+    {
+        perror("inotify_init: ");
+        return -1;
+    }
+    map<int, string> wd_map;
+    if (Recur_Dir(localpath, fd, wd_map) < 0)
+    {
+        cout << "Recurse directory failed!" << endl;
+        return -1;
+    }
+    queue<_inotify_event*> event_que;
+    
+    while (true)
+    {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        if (select(FD_SETSIZE, &rfds, NULL, NULL, NULL) > 0)
+        {
+            if (Read_Event(event_que, fd) < 0)
+            {
+                return -1;
+            }
+            else
+            {
+                Handle_Events(event_que, fd, wd_map);
+            }
+        }
     }
 #endif
-    
-    if (argc != 3)
+}
+
+int main(int argc, char** argv)
+{
+    char ch;
+    string host;
+    while ((ch = getopt(argc, argv, "h:l:r:p:d")) != -1)
     {
-        cout << "Lack of arguments!" << endl;
-        return -1;
+        switch (ch)
+        {
+        case 'h':
+            host = optarg;
+            break;
+        case 'l':
+            localpath = optarg;
+            break;
+        case 'r':
+            remotepath = optarg;
+            break;
+        case 'p':
+            sscanf(optarg, "%d", &port);
+            break;
+        case 'd':
+            debug_mode = true;
+            log.set_level(1);
+            break;
+        default:
+            cout << "usage: autosync <-h username@hostname> <-l localpath> <-r remotepath> [-p port] [-d]" << endl;
+            return -1;
+        }
     }
-
-    string host = argv[1];
-    string path = argv[2];
-    int rc = libssh2_init(0);
-    if (rc != 0) {
-        perror("libssh2 initialization failed: ");
-        return -1;
-    }
-
     char cur_user[1024] = { 0 };
-#ifdef WIN32
+#ifdef WINDOWS_ENV
     unsigned long dwNameLen = 0;
     GetUserName(cur_user, &dwNameLen);
 #else // UNIX like
@@ -142,14 +283,12 @@ int main(int argc, char *argv[])
     strcpy(cur_user, pwd->pw_name);
 #endif 
 
-    string username;
-    string hostname;
     int pos = host.find('@');
-    if (pos == 0 || pos == host.length() - 1) {
+    if (pos == 0 || pos == host.length() - 1 || localpath[0] != '/' || remotepath[0] != '/') {
         cout << "Invalid arguments!" << endl;
         return -1;
     }
-    else if (pos == string::npos) 
+    else if (pos == string::npos)
     {
         username = cur_user;
         hostname = host;
@@ -159,246 +298,43 @@ int main(int argc, char *argv[])
         username = host.substr(0, pos);
         hostname = host.substr(pos + 1);
     }
-    
-    unsigned long hostaddr = inet_addr(hostname.c_str());
 
-    /* Ultra basic "connect to port 22 on localhost"
-    * Your code is responsible for creating the socket establishing the
-    * connection
-    */
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in sin;
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(22);
-    sin.sin_addr.s_addr = hostaddr;
-    if (connect(sock, (struct sockaddr*)(&sin), sizeof(struct sockaddr_in)) != 0) {
-        perror("failed to connect:");
-        return -1;
-    }
-
-    /* Create a session instance */
-    LIBSSH2_SESSION* session = libssh2_session_init();
-
-    if (!session)
+    string key_dir = strcmp(cur_user, "root") == 0 ? "/root/.ssh/" : "/home/" + username + "/.ssh/";
+    if (access((key_dir + "id_rsa.pub").c_str(), F_OK) != 0 || access((key_dir + "id_rsa").c_str(), F_OK) != 0)
     {
-        perror("libssh session init failed:");
-        return -1;
-    }
-    /* tell libssh2 we want it all done non-blocking */
-    libssh2_session_set_blocking(session, 0);
-
-
-    /* ... start it up. This will trade welcome banners, exchange keys,
-    * and setup crypto, compression, and MAC layers
-    */
-    while ((rc = libssh2_session_handshake(session, sock)) == LIBSSH2_ERROR_EAGAIN);
-    if (rc) {
-        perror("Failure establishing SSH session: ");
-        return -1;
+        system("ssh-keygen");
     }
 
-    LIBSSH2_KNOWNHOSTS* nh = libssh2_knownhost_init(session);
-    if (!nh) {
-        /* eeek, do cleanup here */
-        perror("libssh knownhost init failed: ");
-        return -1;
-    }
-
-    /* read all hosts from here */
-    //libssh2_knownhost_readfile(nh, "known_hosts", LIBSSH2_KNOWNHOST_FILE_OPENSSH);
-
-    /* store all known hosts to here */
-    //libssh2_knownhost_writefile(nh, "dumpfile", LIBSSH2_KNOWNHOST_FILE_OPENSSH);
-
-    size_t len;
-    int type;
-    const char* fingerprint = libssh2_session_hostkey(session, &len, &type);
-
-    if (fingerprint) 
+    string cmd_option = boost::str(boost::format(" -p %1% %2%@%3% ") % port % username % hostname);
+    if (access((key_dir + "id_rsa.pub").c_str(), F_OK) == 0 || access((key_dir + "id_rsa").c_str(), F_OK) == 0)
     {
-        struct libssh2_knownhost *host;
-#if LIBSSH2_VERSION_NUM >= 0x010206
-        /* introduced in 1.2.6 */
-        int check = libssh2_knownhost_checkp(nh, hostname.c_str(), 22, fingerprint, len,
-            LIBSSH2_KNOWNHOST_TYPE_PLAIN | LIBSSH2_KNOWNHOST_KEYENC_RAW, &host);
-#else
-        /* 1.2.5 or older */
-        int check = libssh2_knownhost_check(nh, hostname.c_str(), fingerprint, len,
-            LIBSSH2_KNOWNHOST_TYPE_PLAIN | LIBSSH2_KNOWNHOST_KEYENC_RAW, &host);
-#endif
-        fprintf(stderr, "Host check: %d, key: %s\n", check,
-            (check <= LIBSSH2_KNOWNHOST_CHECK_MISMATCH) ?  host->key : "<none>");
-
-        /*****
-        * At this point, we could verify that 'check' tells us the key is
-        * fine or bail out.
-        *****/
+        system(("ssh-copy-id" + cmd_option).c_str());
     }
-    else 
+
+    if (access(localpath.c_str(), F_OK) != 0)
     {
-        /* eeek, do cleanup here */
+        cout << "Local path is not exist!" << endl;
         return -1;
     }
-    libssh2_knownhost_free(nh);
-
-
-
-    string keypath = strcmp(cur_user, "root") == 0 ? "/root/.ssh/" : "/home/" + username + "/.ssh/";
-    //if(access((keypath+"id_rsa.pub").c_str(), F_OK) != 0 || access((keypath + "id_rsa").c_str(), F_OK) != 0)
-    //{
-    //    cout << "Lack of key pairs or be damaged." << endl;
-    //    cout << "Do you want to generate the key pairs (yes/no)?" << endl;
-    //    string str;
-    //    getline(cin, str);
-    //    if (str == "yes")
-    //    {
-    //        //Generate key pairs.
-    //    }
-    //}
-    int signal = 0;
-    //while (access((keypath + "id_rsa.pub").c_str(), F_OK) == 0 && access((keypath + "id_rsa").c_str(), F_OK) == 0)
-    //{
-    //    /* Or by public key */
-    //    while ((rc = libssh2_userauth_publickey_fromfile(session, username.c_str(), 
-    //        (keypath + "id_rsa.pub").c_str(), (keypath + "id_rsa").c_str(), NULL)) == LIBSSH2_ERROR_EAGAIN);
-    //    if (rc == LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED) {
-    //        cout << "The username/public key combination was invalid or the password is not null." << endl;
-    //        if (signal == 0)
-    //        {
-    //            cout << "Do you want to generate the key pairs (yes/no)?" << endl;
-    //            string str;
-    //            getline(cin, str);
-    //            if (str == "yes")
-    //            {
-    //                //Generate key pairs.
-    //                continue;
-    //            }
-    //        }
-    //        signal = 0;
-    //        break;
-    //    }
-    //    else if (rc)
-    //    {
-    //        fprintf(stderr, "\tAuthentication by public key failed\n");
-    //        return clean(session, sock);
-    //    }
-    //    signal = 1;
-    //}
-    if (signal == 0)
+    boost::format fmt("'if [ ! -d %1% ];then mkdir -p %1%;elif [ ! -x %1% ];then echo error;fi'");
+    string remote_cmd = boost::str(fmt % remotepath);
+    FILE* fp = popen(("ssh" + cmd_option + remote_cmd).c_str(), "r");
+    if (fp)
     {
-        cout << host << "'s password:";
-        string password;
-        input_passwd(password);
-        if (password.length() > 0)
+        char buff[1024] = { 0 };
+        if (fgets(buff, sizeof(buff), fp))
         {
-            /* We could authenticate via password */
-            while ((rc = libssh2_userauth_password(session, username.c_str(), password.c_str())) == LIBSSH2_ERROR_EAGAIN);
-            if (rc) {
-                perror("Authentication by password failed: ");
-                return clean(session, sock);
-            }
+            cout << buff << endl;
+            return -1;
         }
-    }
-#if 0
-    libssh2_trace(session, ~0);
-
-#endif
-    LIBSSH2_CHANNEL* channel;
-    /* Exec non-blocking on the remote host */
-    while ((channel = libssh2_channel_open_session(session)) == NULL &&
-        libssh2_session_last_error(session, NULL, NULL, 0) == LIBSSH2_ERROR_EAGAIN)
-    {
-        waitsocket(sock, session);
-    }
-    if (channel == NULL)
-    {
-        fprintf(stderr, "Error\n");
-        exit(1);
-    }
-    char commandline[1024] = { 0 };
-    string pub_key;
-    if (signal == 1)
-    {
-        fstream fin(keypath + "id_rsa.pub");
-        getline(fin, pub_key);
-        string remote_authorized_keys = (username == "root" ? "/root/" : "/home/" + username) + "/.ssh/authorized_keys";
-        snprintf(commandline, sizeof(commandline),
-            "echo %s >> %s;if [ ! -d %s ];then mkdir -p %s;elif [ ! -x %s ];then echo error;fi", 
-            pub_key.c_str(), remote_authorized_keys, path.c_str(), path.c_str(), path.c_str());
     }
     else
     {
-        snprintf(commandline, sizeof(commandline),
-            "if [ ! -d %s ];then mkdir -p %s;elif [ ! -x %s ];then echo error;fi", path.c_str(), path.c_str(), path.c_str());
+        cout << "Check remote path failed!" << endl;
     }
-    while ((rc = libssh2_channel_exec(channel, commandline)) == LIBSSH2_ERROR_EAGAIN)
+    if (File_Monitor() < 0)
     {
-        waitsocket(sock, session);
+        cout << "Exception occurred" << endl;
     }
-    if (rc != 0)
-    {
-        fprintf(stderr, "Error\n");
-        exit(1);
-    }
-
-    int bytecount = 0;
-    char buffer[1024] = { 0 };
-    while(true)
-    {
-        /* loop until we block */
-        int rc; 
-        do
-        {
-            rc = libssh2_channel_read_stderr(channel, buffer + bytecount, sizeof(buffer) - bytecount);
-            if (rc > 0)
-            {
-                bytecount += rc;
-            }
-            else 
-            {
-                if (rc != LIBSSH2_ERROR_EAGAIN)
-                {   /* no need to output this for the EAGAIN case */
-                    fprintf(stderr, "libssh2_channel_read returned %d\n", rc);
-                }
-            }
-        } while (rc > 0);
-
-        /* this is due to blocking that would occur otherwise so we loop on
-        this condition */
-        if (rc == LIBSSH2_ERROR_EAGAIN)
-        {
-            waitsocket(sock, session);
-        }
-        else
-        {
-            break;
-        }
-    }
-
-    int exitcode = 127;
-    while ((rc = libssh2_channel_close(channel)) == LIBSSH2_ERROR_EAGAIN)
-    {
-        waitsocket(sock, session);
-    }
-    char *exitsignal = (char *)"none";
-    if (rc == 0)
-    {
-        exitcode = libssh2_channel_get_exit_status(channel);
-        libssh2_channel_get_exit_signal(channel, &exitsignal, NULL, NULL, NULL, NULL, NULL);
-    }
-
-    if (exitsignal)
-    {
-        fprintf(stderr, "\nGot signal: %s\n", exitsignal);
-    }
-    else
-    {
-        fprintf(stderr, "\nEXIT: %d bytecount: %d\n", exitcode, bytecount);
-    }
-    cout << buffer << endl;
-    libssh2_channel_free(channel);
-
-    channel = NULL;
-    clean(session, sock);
     return 0;
 }

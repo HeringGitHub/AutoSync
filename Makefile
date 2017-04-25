@@ -1,11 +1,13 @@
-all: AutoSync
+all: autosync
 
-LIBS = -lssh2
+LIBS = 
 
 FLAGS = -g
 
-AutoSync: main.cpp
-	$(CXX) -o $@ main.cpp $(LIBS) $(FLAGS)
+OBJECT = main.o Log.o
+autosync: $(OBJECT)
+	$(CXX) -o $@ $^ $(LIBS) $(FLAGS)
+	rm -rf *.o
 
 clean:
-	rm -rf AutoSync
+	rm -rf autosync
